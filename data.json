@@ -1,5 +1,9 @@
 {
-  "guilds": {},
+  "guilds": {
+    "1476850329646534728": {
+      "prefix": "?"
+    }
+  },
   "warnings": {},
   "levels": {},
   "economy": {}
