@@ -1,8 +1,8 @@
 {
-  "name": "gkh-mod-bot",
+  "name": "gkh-bot",
   "version": "1.0.0",
-  "description": "Dyno style moderation bot",
   "main": "index.js",
+  "scripts": { "start": "node index.js" },
   "dependencies": {
     "discord.js": "^14.14.1"
   }
