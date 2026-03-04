@@ -1,7 +1,5 @@
 {
+  "guilds": {},
   "warnings": {},
-  "afk": {},
-  "reminders": [],
-  "sticky": {},
-  "cases": {}
+  "levels": {}
 }
