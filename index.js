@@ -1,3 +1,4 @@
+const { handleExtrasSlash, extraSlashCommandBuilders } = require("./extras");
 const {
   Client,
   GatewayIntentBits,
@@ -302,9 +303,12 @@ function slashCommands() {
     new SlashCommandBuilder().setName("levelrole").setDescription("Add a role reward at a level.")
       .addIntegerOption(o => o.setName("level").setDescription("Level number").setRequired(true))
       .addRoleOption(o => o.setName("role").setDescription("Role to give").setRequired(true)),
-  ];
+  ]; //
 
-  return cmds.map(c => c.toJSON());
+  const base = cmds.map(c => c.toJSON());
+  const extra = extraSlashCommandBuilders();
+  return base.concat(extra);
+
 }
 
 async function registerSlash() {
@@ -1060,3 +1064,4 @@ client.on(Events.InteractionCreate, async (interaction) => {
 // Start
 // =====================
 client.login(TOKEN);
+
