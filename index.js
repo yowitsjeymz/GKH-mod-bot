@@ -1,30 +1,102 @@
 const {
   Client,
   GatewayIntentBits,
+  Partials,
   PermissionsBitField,
   EmbedBuilder,
   Events,
+  REST,
+  Routes,
+  SlashCommandBuilder,
+  ActionRowBuilder,
+  StringSelectMenuBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
   ChannelType,
 } = require("discord.js");
 
-const {
-  nextCase,
-  addWarning, getWarnings, clearWarnings,
-  setAFK, getAFK, clearAFK,
-  setSticky, getSticky, removeSticky, setStickyLastId
-} = require("./db");
+const fs = require("fs");
 
-const PREFIX = process.env.PREFIX || "?";
-const MODLOG_CHANNEL_ID = process.env.MODLOG_CHANNEL_ID || null;
-const SUGGEST_CHANNEL_ID = process.env.SUGGEST_CHANNEL_ID || null;
-const REPORT_CHANNEL_ID = process.env.REPORT_CHANNEL_ID || null;
-const TICKET_CATEGORY_ID = process.env.TICKET_CATEGORY_ID || null;
+// =====================
+// Config / Storage
+// =====================
+const TOKEN = (process.env.TOKEN || "").trim();
+if (!TOKEN) {
+  console.log("Missing TOKEN");
+  process.exit(1);
+}
 
-const CLIENT_ID = process.env.CLIENT_ID || null;
+const DARK_YELLOW = 0xD4A017; // darker yellow banner
 
-const YELLOW = 0xFEE75C;
-const startedAt = Date.now();
+const DATA_FILE = "./data.json";
+function loadDB() {
+  if (!fs.existsSync(DATA_FILE)) {
+    fs.writeFileSync(DATA_FILE, JSON.stringify({ guilds: {}, warnings: {}, levels: {} }, null, 2));
+  }
+  return JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
+}
+function saveDB(db) {
+  fs.writeFileSync(DATA_FILE, JSON.stringify(db, null, 2));
+}
+let db = loadDB();
 
+// guild settings helpers
+function gSettings(guildId) {
+  db.guilds[guildId] ??= {
+    prefix: "?",
+    modlogChannelId: null,
+    verifyChannelId: null,
+    unverifiedRoleId: null,
+    verifiedRoleId: null,
+    welcomeChannelId: null,
+    welcomeMessage: "Welcome {user} to {server}!",
+    levelUpChannelId: null,
+    levelRoleRewards: [] // [{level: 5, roleId: "..."}, ...]
+  };
+  return db.guilds[guildId];
+}
+
+// warnings helpers
+function getWarns(guildId, userId) {
+  db.warnings[guildId] ??= {};
+  db.warnings[guildId][userId] ??= [];
+  return db.warnings[guildId][userId];
+}
+function addWarn(guildId, userId, entry) {
+  const arr = getWarns(guildId, userId);
+  arr.push(entry);
+  saveDB(db);
+  return arr;
+}
+function clearWarns(guildId, userId) {
+  db.warnings[guildId] ??= {};
+  db.warnings[guildId][userId] = [];
+  saveDB(db);
+}
+
+// leveling helpers
+function lvlData(guildId, userId) {
+  db.levels[guildId] ??= {};
+  db.levels[guildId][userId] ??= { xp: 0, level: 0, lastXpAt: 0 };
+  return db.levels[guildId][userId];
+}
+function xpNeededFor(level) {
+  // smooth curve
+  // level 0->1 around 100, then grows
+  return 5 * (level ** 2) + 50 * level + 100;
+}
+function calcLevelFromXP(xp) {
+  let level = 0;
+  while (xp >= xpNeededFor(level)) level++;
+  return level;
+}
+
+// =====================
+// Discord Client
+// =====================
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -33,39 +105,57 @@ const client = new Client({
     GatewayIntentBits.MessageContent,
     GatewayIntentBits.GuildVoiceStates,
   ],
+  partials: [Partials.Channel]
 });
 
-function embed(desc, title = null) {
-  const em = new EmbedBuilder().setColor(YELLOW).setDescription(desc).setTimestamp();
+// =====================
+// UI helpers
+// =====================
+function E(desc, title = null) {
+  const em = new EmbedBuilder().setColor(DARK_YELLOW).setDescription(desc).setTimestamp();
   if (title) em.setTitle(title);
   return em;
 }
 
-function usage(cmd, desc, use) {
+function dynoUsageEmbed({ command, description, usage, example, cooldownSec = 3 }) {
   return new EmbedBuilder()
-    .setColor(YELLOW)
-    .setTitle(cmd)
-    .setDescription(desc)
-    .addFields({ name: "Usage", value: use })
+    .setColor(DARK_YELLOW)
+    .setTitle(`Command: ${command}`)
+    .addFields(
+      { name: "Description", value: description || "—" },
+      { name: "Cooldown", value: `${cooldownSec} seconds`, inline: true },
+      { name: "Usage", value: usage || "—" },
+      { name: "Example", value: example || "—" },
+    )
     .setTimestamp();
 }
 
-function hasPerm(member, perm) {
-  return member?.permissions?.has(perm);
+async function fetchTextChannel(guild, channelId) {
+  if (!channelId) return null;
+  const ch = await guild.channels.fetch(channelId).catch(() => null);
+  if (!ch || !ch.isTextBased()) return null;
+  return ch;
 }
 
-function parseIdOrMention(raw) {
+async function modlog(guild, text) {
+  const s = gSettings(guild.id);
+  const ch = await fetchTextChannel(guild, s.modlogChannelId);
+  if (!ch) return;
+  await ch.send({ embeds: [E(text, "Mod Log")] }).catch(() => {});
+}
+
+// mention OR userId support
+function parseUserId(raw) {
   if (!raw) return null;
   const m = raw.match(/^<@!?(\d+)>$/);
   if (m) return m[1];
   if (/^\d{15,25}$/.test(raw)) return raw;
   return null;
 }
-
-async function resolveMember(message, raw) {
-  const id = parseIdOrMention(raw);
+async function resolveMember(guild, raw) {
+  const id = parseUserId(raw);
   if (!id) return null;
-  return await message.guild.members.fetch(id).catch(() => null);
+  return await guild.members.fetch(id).catch(() => null);
 }
 
 function parseRoleId(raw) {
@@ -76,25 +166,8 @@ function parseRoleId(raw) {
   return null;
 }
 
-function rest(args, start) {
-  const t = args.slice(start).join(" ").trim();
-  return t.length ? t : "No reason provided";
-}
-
-async function getTextChannel(guild, id) {
-  if (!id) return null;
-  const ch = await guild.channels.fetch(id).catch(() => null);
-  if (!ch || !ch.isTextBased()) return null;
-  return ch;
-}
-
-async function modlog(guild, text) {
-  const ch = await getTextChannel(guild, MODLOG_CHANNEL_ID);
-  if (!ch) return;
-  await ch.send({ embeds: [embed(text, "Mod Log")] }).catch(() => {});
-}
-
-function humanUptime(ms) {
+function uptimeStr() {
+  const ms = Date.now() - startedAt;
   const s = Math.floor(ms / 1000);
   const d = Math.floor(s / 86400);
   const h = Math.floor((s % 86400) / 3600);
@@ -108,737 +181,882 @@ function humanUptime(ms) {
   return parts.join(" ");
 }
 
-/* Sticky behavior */
-async function handleSticky(message) {
-  if (!message.guild || message.author.bot) return;
-  const sticky = getSticky(message.guild.id, message.channel.id);
-  if (!sticky) return;
-  if (sticky.lastMessageId && message.id === sticky.lastMessageId) return;
+const startedAt = Date.now();
 
-  setTimeout(async () => {
-    try {
-      const sent = await message.channel.send({ embeds: [embed(sticky.text, "Sticky")] });
-      setStickyLastId(message.guild.id, message.channel.id, sent.id);
-    } catch {}
-  }, 1100);
+// =====================
+// Captcha (button + modal)
+// =====================
+const captchaMap = new Map(); // userId -> answer
+
+function makeCaptchaQuestion() {
+  const a = 2 + Math.floor(Math.random() * 9);
+  const b = 2 + Math.floor(Math.random() * 9);
+  return { q: `${a} + ${b}`, ans: String(a + b) };
 }
 
-/* AFK mention ping */
-async function handleAFK(message) {
-  if (!message.guild || message.author.bot) return;
+function verifyPanelEmbed(guildName) {
+  return new EmbedBuilder()
+    .setColor(DARK_YELLOW)
+    .setTitle("Verification")
+    .setDescription(
+      `To access **${guildName}**, click **Verify** and solve the captcha.\n\nThis helps stop spam/bot accounts.`
+    )
+    .setTimestamp();
+}
 
-  // if author is AFK, remove AFK
-  const mine = getAFK(message.guild.id, message.author.id);
-  if (mine) {
-    clearAFK(message.guild.id, message.author.id);
-    await message.channel.send({ embeds: [embed(`<@${message.author.id}> is no longer AFK.`, "AFK")] }).catch(() => {});
+function verifyRow() {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId("verify_start")
+      .setLabel("Verify")
+      .setStyle(ButtonStyle.Primary)
+  );
+}
+
+// =====================
+// Slash Commands Registration
+// =====================
+function slashCommands() {
+  // Core commands requested (more can be added anytime)
+  const cmds = [
+    new SlashCommandBuilder().setName("commands").setDescription("Show command list (MEE6-style menu)"),
+
+    // Moderation & security
+    new SlashCommandBuilder().setName("ban").setDescription("Permanently bans a user.")
+      .addUserOption(o => o.setName("user").setDescription("Target user").setRequired(true))
+      .addStringOption(o => o.setName("reason").setDescription("Reason")),
+
+    new SlashCommandBuilder().setName("unban").setDescription("Unban a user by User ID.")
+      .addStringOption(o => o.setName("userid").setDescription("User ID").setRequired(true))
+      .addStringOption(o => o.setName("reason").setDescription("Reason")),
+
+    new SlashCommandBuilder().setName("kick").setDescription("Kicks a user (they can rejoin).")
+      .addUserOption(o => o.setName("user").setDescription("Target user").setRequired(true))
+      .addStringOption(o => o.setName("reason").setDescription("Reason")),
+
+    new SlashCommandBuilder().setName("timeout").setDescription("Timeout a user for X minutes.")
+      .addUserOption(o => o.setName("user").setDescription("Target user").setRequired(true))
+      .addIntegerOption(o => o.setName("minutes").setDescription("Minutes").setRequired(true))
+      .addStringOption(o => o.setName("reason").setDescription("Reason")),
+
+    new SlashCommandBuilder().setName("warn").setDescription("Warn a user (saved in database).")
+      .addUserOption(o => o.setName("user").setDescription("Target user").setRequired(true))
+      .addStringOption(o => o.setName("reason").setDescription("Reason")),
+
+    new SlashCommandBuilder().setName("warnings").setDescription("Show warnings of a user.")
+      .addUserOption(o => o.setName("user").setDescription("Target user").setRequired(true)),
+
+    new SlashCommandBuilder().setName("clearwarns").setDescription("Clear warnings of a user.")
+      .addUserOption(o => o.setName("user").setDescription("Target user").setRequired(true)),
+
+    new SlashCommandBuilder().setName("purge").setDescription("Bulk delete messages (1-100).")
+      .addIntegerOption(o => o.setName("amount").setDescription("1-100").setRequired(true)),
+
+    new SlashCommandBuilder().setName("lock").setDescription("Lock current channel (disable send messages)."),
+    new SlashCommandBuilder().setName("unlock").setDescription("Unlock current channel."),
+    new SlashCommandBuilder().setName("slowmode").setDescription("Set slowmode for this channel.")
+      .addIntegerOption(o => o.setName("seconds").setDescription("0-21600").setRequired(true)),
+
+    new SlashCommandBuilder().setName("nuke").setDescription("Clone and delete channel to wipe chat history."),
+
+    // Utility
+    new SlashCommandBuilder().setName("ping").setDescription("Check bot latency."),
+    new SlashCommandBuilder().setName("serverinfo").setDescription("Show server info."),
+    new SlashCommandBuilder().setName("userinfo").setDescription("Show user info.")
+      .addUserOption(o => o.setName("user").setDescription("User (optional)")),
+    new SlashCommandBuilder().setName("avatar").setDescription("Show user avatar.")
+      .addUserOption(o => o.setName("user").setDescription("User (optional)")),
+    new SlashCommandBuilder().setName("banner").setDescription("Show user banner.")
+      .addUserOption(o => o.setName("user").setDescription("User (optional)")),
+    new SlashCommandBuilder().setName("uptime").setDescription("Show bot uptime."),
+    new SlashCommandBuilder().setName("botinfo").setDescription("Show bot statistics."),
+    new SlashCommandBuilder().setName("poll").setDescription("Create a poll (👍/👎).")
+      .addStringOption(o => o.setName("question").setDescription("Poll question").setRequired(true)),
+
+    // Setup / settings
+    new SlashCommandBuilder().setName("setmodlogs").setDescription("Set mod logs channel.")
+      .addChannelOption(o => o.setName("channel").setDescription("Text channel").addChannelTypes(ChannelType.GuildText).setRequired(true)),
+
+    new SlashCommandBuilder().setName("setup-verify").setDescription("Setup captcha verification.")
+      .addChannelOption(o => o.setName("channel").setDescription("Verify channel").addChannelTypes(ChannelType.GuildText).setRequired(true))
+      .addRoleOption(o => o.setName("unverified").setDescription("Unverified role").setRequired(true))
+      .addRoleOption(o => o.setName("verified").setDescription("Verified role").setRequired(true)),
+
+    new SlashCommandBuilder().setName("setup-welcome").setDescription("Setup welcome channel & message.")
+      .addChannelOption(o => o.setName("channel").setDescription("Welcome channel").addChannelTypes(ChannelType.GuildText).setRequired(true))
+      .addStringOption(o => o.setName("message").setDescription("Use {user} and {server}").setRequired(true)),
+
+    new SlashCommandBuilder().setName("prefix").setDescription("Change prefix commands symbol.")
+      .addStringOption(o => o.setName("prefix").setDescription("Example: ? or !").setRequired(true)),
+
+    // AFK
+    new SlashCommandBuilder().setName("afk").setDescription("Set AFK status.")
+      .addStringOption(o => o.setName("message").setDescription("AFK message")),
+
+    // Leveling
+    new SlashCommandBuilder().setName("rank").setDescription("Show your rank / level.")
+      .addUserOption(o => o.setName("user").setDescription("User (optional)")),
+    new SlashCommandBuilder().setName("leaderboard").setDescription("Show top XP leaderboard."),
+    new SlashCommandBuilder().setName("setlevelchannel").setDescription("Set level-up announcement channel.")
+      .addChannelOption(o => o.setName("channel").setDescription("Text channel").addChannelTypes(ChannelType.GuildText).setRequired(true)),
+    new SlashCommandBuilder().setName("levelrole").setDescription("Add a role reward at a level.")
+      .addIntegerOption(o => o.setName("level").setDescription("Level number").setRequired(true))
+      .addRoleOption(o => o.setName("role").setDescription("Role to give").setRequired(true)),
+  ];
+
+  return cmds.map(c => c.toJSON());
+}
+
+async function registerSlash() {
+  const CLIENT_ID = process.env.CLIENT_ID;
+  const GUILD_ID = process.env.GUILD_ID;
+  if (!CLIENT_ID || !GUILD_ID) {
+    console.log("Slash commands not registered (missing CLIENT_ID or GUILD_ID).");
+    return;
   }
+  const rest = new REST({ version: "10" }).setToken(TOKEN);
+  await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), {
+    body: slashCommands(),
+  });
+  console.log("Slash commands registered.");
+}
 
-  // if mentions AFK users
-  for (const user of message.mentions.users.values()) {
-    const afk = getAFK(message.guild.id, user.id);
-    if (afk) {
-      await message.channel.send({
-        embeds: [embed(`<@${user.id}> is AFK: ${afk.msg}`, "AFK")]
-      }).catch(() => {});
+// =====================
+// /commands MEE6-style menu
+// =====================
+function commandsMenuEmbed(category) {
+  const cat = category || "home";
+
+  const pages = {
+    home: {
+      title: "Commands",
+      desc: "Select the plugin for which you need help.",
+      fields: []
+    },
+    mod: {
+      title: "Moderation & Security",
+      desc: [
+        "/ban - Permanently bans a user.",
+        "/unban - Unban by User ID.",
+        "/kick - Removes a user (can rejoin).",
+        "/timeout - Timeout a user for X minutes.",
+        "/warn - Warn a user (saved).",
+        "/warnings - Show a user's warnings.",
+        "/clearwarns - Clear a user's warnings.",
+        "/purge - Bulk delete messages.",
+        "/lock - Lock channel.",
+        "/unlock - Unlock channel.",
+        "/slowmode - Set channel slowmode.",
+        "/nuke - Wipe channel (clone & delete).",
+        "/setmodlogs - Set mod logs channel.",
+      ].join("\n"),
+      fields: []
+    },
+    utility: {
+      title: "Utility",
+      desc: [
+        "/ping - Bot latency.",
+        "/serverinfo - Server details.",
+        "/userinfo - User details.",
+        "/avatar - Show avatar.",
+        "/banner - Show banner.",
+        "/uptime - Bot uptime.",
+        "/botinfo - Bot info/stats.",
+        "/poll - Create poll.",
+        "/prefix - Change prefix symbol.",
+      ].join("\n"),
+      fields: []
+    },
+    verify: {
+      title: "Verification",
+      desc: [
+        "/setup-verify - Setup captcha verification.",
+        "Bot will give Unverified role on join and require captcha in verify channel.",
+      ].join("\n"),
+      fields: []
+    },
+    leveling: {
+      title: "Leveling",
+      desc: [
+        "/rank - Show level & XP.",
+        "/leaderboard - Top XP.",
+        "/setlevelchannel - Set level-up channel.",
+        "/levelrole - Give role at a level (reward).",
+      ].join("\n"),
+      fields: []
+    },
+    extra: {
+      title: "Extra",
+      desc: [
+        "/setup-welcome - Welcome channel/message.",
+        "/afk - AFK status.",
+        "Prefix commands are still available (example: ?sticky).",
+      ].join("\n"),
+      fields: []
     }
-  }
+  };
+
+  const p = pages[cat] || pages.home;
+  const em = new EmbedBuilder()
+    .setColor(DARK_YELLOW)
+    .setTitle(p.title)
+    .setDescription(p.desc)
+    .setTimestamp();
+
+  for (const f of (p.fields || [])) em.addFields(f);
+  return em;
 }
 
-function helpText() {
-  return [
-    `Prefix: ${PREFIX}`,
-    "",
-    "Moderation",
-    `${PREFIX}ban <@user|id> (reason)`,
-    `${PREFIX}unban <userId> (reason)`,
-    `${PREFIX}kick <@user|id> (reason)`,
-    `${PREFIX}mute <@user|id> <minutes> (reason)`,
-    `${PREFIX}unmute <@user|id> (reason)`,
-    `${PREFIX}timeout <@user|id> <minutes> (reason)`,
-    `${PREFIX}untimeout <@user|id> (reason)`,
-    `${PREFIX}warn <@user|id> (reason)`,
-    `${PREFIX}warnings <@user|id>`,
-    `${PREFIX}clearwarn <@user|id>`,
-    `${PREFIX}purge <1-100>`,
-    `${PREFIX}clear <1-100>`,
-    `${PREFIX}slowmode <seconds>`,
-    `${PREFIX}lock`,
-    `${PREFIX}unlock`,
-    `${PREFIX}nick <@user|id> <nickname>`,
-    `${PREFIX}role add <@user|id> <@role|roleId>`,
-    `${PREFIX}role remove <@user|id> <@role|roleId>`,
-    "",
-    "Utility",
-    `${PREFIX}ping`,
-    `${PREFIX}help`,
-    `${PREFIX}userinfo <@user|id>`,
-    `${PREFIX}serverinfo`,
-    `${PREFIX}avatar <@user|id>`,
-    `${PREFIX}banner <@user|id>`,
-    `${PREFIX}uptime`,
-    `${PREFIX}botinfo`,
-    `${PREFIX}invite`,
-    `${PREFIX}stats`,
-    `${PREFIX}8ball <question...>`,
-    `${PREFIX}coinflip`,
-    `${PREFIX}dice`,
-    `${PREFIX}joke`,
-    `${PREFIX}rate <thing...>`,
-    `${PREFIX}say <message...>`,
-    `${PREFIX}poll <question...>`,
-    "",
-    "Server Management",
-    `${PREFIX}addrole <@user|id> <@role|roleId>`,
-    `${PREFIX}removerole <@user|id> <@role|roleId>`,
-    `${PREFIX}roleinfo <@role|roleId>`,
-    `${PREFIX}createrole <name>`,
-    `${PREFIX}deleterole <@role|roleId>`,
-    `${PREFIX}channelinfo`,
-    `${PREFIX}createchannel <name>`,
-    `${PREFIX}deletechannel`,
-    "",
-    "Voice",
-    `${PREFIX}disconnect <@user|id> (reason)`,
-    `${PREFIX}disconnectall (reason)`,
-    `${PREFIX}move <@user|id> <voiceChannelId>`,
-    `${PREFIX}mutevc <@user|id> (reason)`,
-    `${PREFIX}unmutevc <@user|id> (reason)`,
-    "",
-    "Extra",
-    `${PREFIX}sticky set <text...>`,
-    `${PREFIX}sticky remove`,
-    `${PREFIX}sticky show`,
-    `${PREFIX}announce <#channel|channelId> <message...>`,
-    `${PREFIX}afk <message...>`,
-    `${PREFIX}suggest <text...>`,
-    `${PREFIX}report <@user|id> <reason...>`,
-    `${PREFIX}ticket <reason...>`,
-  ].join("\n");
+function commandsMenuRow(selected = "home") {
+  return new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder()
+      .setCustomId("commands_menu")
+      .setPlaceholder("Select category")
+      .addOptions(
+        { label: "Home", value: "home", default: selected === "home" },
+        { label: "Moderation & Security", value: "mod", default: selected === "mod" },
+        { label: "Utility", value: "utility", default: selected === "utility" },
+        { label: "Verification", value: "verify", default: selected === "verify" },
+        { label: "Leveling", value: "leveling", default: selected === "leveling" },
+        { label: "Extra", value: "extra", default: selected === "extra" },
+      )
+  );
 }
 
-client.once(Events.ClientReady, (c) => {
-  console.log(`Logged in as ${c.user.tag}`);
-});
+// =====================
+// Prefix command handler (keep old commands + more)
+// =====================
+async function handlePrefix(message) {
+  const s = gSettings(message.guild.id);
+  const prefix = s.prefix || "?";
+  if (!message.content.startsWith(prefix)) return;
 
-client.on(Events.MessageCreate, async (message) => {
-  await handleAFK(message);
-  await handleSticky(message);
-
-  if (!message.guild) return;
-  if (message.author.bot) return;
-  if (!message.content.startsWith(PREFIX)) return;
-
-  const args = message.content.slice(PREFIX.length).trim().split(/\s+/);
+  const args = message.content.slice(prefix.length).trim().split(/\s+/);
   const cmd = (args.shift() || "").toLowerCase();
 
-  /* Utility */
-  if (cmd === "help") {
-    return message.channel.send({ embeds: [embed("```" + helpText() + "```", "Help")] });
-  }
-
-  if (cmd === "ping") {
-    return message.channel.send({ embeds: [embed(`Latency: ${client.ws.ping}ms`, "Ping")] });
-  }
-
-  if (cmd === "serverinfo") {
-    const g = message.guild;
-    const owner = await g.fetchOwner().catch(() => null);
-    const txt =
-      `Name: ${g.name}\n` +
-      `ID: ${g.id}\n` +
-      `Owner: ${owner ? owner.user.tag : "Unknown"}\n` +
-      `Members: ${g.memberCount}\n` +
-      `Created: ${g.createdAt.toLocaleString()}`;
-    return message.channel.send({ embeds: [embed(txt, "Server Info")] });
-  }
-
-  if (cmd === "userinfo") {
-    const m = await resolveMember(message, args[0]);
-    if (!m) return message.channel.send({ embeds: [usage(`${PREFIX}userinfo`, "Show user info", `${PREFIX}userinfo <@user|id>`)] });
-
-    const txt =
-      `User: ${m.user.tag}\n` +
-      `ID: ${m.id}\n` +
-      `Joined: ${m.joinedAt ? m.joinedAt.toLocaleString() : "Unknown"}\n` +
-      `Created: ${m.user.createdAt.toLocaleString()}`;
-    return message.channel.send({ embeds: [embed(txt, "User Info")] });
-  }
-
-  if (cmd === "avatar") {
-    const m = await resolveMember(message, args[0]) || message.member;
-    const url = m.user.displayAvatarURL({ size: 1024 });
-    return message.channel.send({ embeds: [embed(url, "Avatar")] });
-  }
-
-  if (cmd === "banner") {
-    const m = await resolveMember(message, args[0]) || message.member;
-    const u = await m.user.fetch().catch(() => null);
-    const url = u?.bannerURL({ size: 1024 }) || "No banner found.";
-    return message.channel.send({ embeds: [embed(url, "Banner")] });
-  }
-
-  if (cmd === "uptime") {
-    return message.channel.send({ embeds: [embed(humanUptime(Date.now() - startedAt), "Uptime")] });
-  }
-
-  if (cmd === "botinfo" || cmd === "stats") {
-    const txt =
-      `Tag: ${client.user.tag}\n` +
-      `Servers: ${client.guilds.cache.size}\n` +
-      `Users (approx): ${client.users.cache.size}\n` +
-      `Uptime: ${humanUptime(Date.now() - startedAt)}`;
-    return message.channel.send({ embeds: [embed(txt, "Bot Info")] });
-  }
-
-  if (cmd === "invite") {
-    if (!CLIENT_ID) return message.channel.send({ embeds: [embed("Missing CLIENT_ID in Railway Variables.", "Invite")] });
-    const link = `https://discord.com/oauth2/authorize?client_id=${CLIENT_ID}&permissions=8&scope=bot%20applications.commands`;
-    return message.channel.send({ embeds: [embed(link, "Invite Link")] });
-  }
-
-  // Fun (simple local)
-  if (cmd === "8ball") {
-    const q = args.join(" ");
-    if (!q) return message.channel.send({ embeds: [usage(`${PREFIX}8ball`, "Magic 8ball", `${PREFIX}8ball <question...>`)] });
-    const answers = ["Yes.", "No.", "Maybe.", "Probably.", "I don't think so.", "Ask again later."];
-    return message.channel.send({ embeds: [embed(answers[Math.floor(Math.random() * answers.length)], "8ball")] });
-  }
-
-  if (cmd === "coinflip") {
-    return message.channel.send({ embeds: [embed(Math.random() < 0.5 ? "Heads" : "Tails", "Coinflip")] });
-  }
-
-  if (cmd === "dice") {
-    return message.channel.send({ embeds: [embed(`You rolled: ${1 + Math.floor(Math.random() * 6)}`, "Dice")] });
-  }
-
-  if (cmd === "joke") {
-    const jokes = ["I told my computer I needed a break. It said: no problem, I'll go to sleep.", "Why did the dev go broke? Too many cache misses."];
-    return message.channel.send({ embeds: [embed(jokes[Math.floor(Math.random() * jokes.length)], "Joke")] });
-  }
-
-  if (cmd === "rate") {
-    const thing = args.join(" ");
-    if (!thing) return message.channel.send({ embeds: [usage(`${PREFIX}rate`, "Rate something", `${PREFIX}rate <thing...>`)] });
-    const score = Math.floor(Math.random() * 11);
-    return message.channel.send({ embeds: [embed(`${thing}\nRating: ${score}/10`, "Rate")] });
-  }
-
-  if (cmd === "say") {
-    const text = args.join(" ");
-    if (!text) return message.channel.send({ embeds: [usage(`${PREFIX}say`, "Repeat message", `${PREFIX}say <message...>`)] });
-    return message.channel.send({ embeds: [embed(text, "Say")] });
-  }
-
-  if (cmd === "poll") {
-    const q = args.join(" ");
-    if (!q) return message.channel.send({ embeds: [usage(`${PREFIX}poll`, "Create poll", `${PREFIX}poll <question...>`)] });
-    const msg = await message.channel.send({ embeds: [embed(q, "Poll")] });
-    await msg.react("👍").catch(() => {});
-    await msg.react("👎").catch(() => {});
-    return;
-  }
-
-  /* Moderation */
-  if (cmd === "warn") {
-    const need = PermissionsBitField.Flags.ModerateMembers;
-    if (!hasPerm(message.member, need)) return message.channel.send({ embeds: [embed("Missing permission: Moderate Members", "Error")] });
-
-    const target = await resolveMember(message, args[0]);
-    if (!target) return message.channel.send({ embeds: [usage(`${PREFIX}warn`, "Warn a user", `${PREFIX}warn <@user|id> (reason)`)] });
-
-    const reason = rest(args, 1);
-    const list = addWarning(message.guild.id, target.id, { at: Date.now(), modId: message.author.id, reason });
-    const caseNo = nextCase(message.guild.id);
-
-    await message.channel.send({ embeds: [embed(`${target} has been warned.\nReason: ${reason}\nWarnings: ${list.length}`, `Warn | Case #${caseNo}`)] });
-    await modlog(message.guild, `Case #${caseNo}\nAction: Warn\nUser: ${target.user.tag} (${target.id})\nModerator: ${message.author.tag} (${message.author.id})\nReason: ${reason}`);
-    return;
-  }
-
-  if (cmd === "warnings") {
-    const need = PermissionsBitField.Flags.ModerateMembers;
-    if (!hasPerm(message.member, need)) return message.channel.send({ embeds: [embed("Missing permission: Moderate Members", "Error")] });
-
-    const target = await resolveMember(message, args[0]);
-    if (!target) return message.channel.send({ embeds: [usage(`${PREFIX}warnings`, "Show warnings", `${PREFIX}warnings <@user|id>`)] });
-
-    const list = getWarnings(message.guild.id, target.id);
-    if (list.length === 0) return message.channel.send({ embeds: [embed(`${target} has no warnings.`, "Warnings")] });
-
-    const last = list.slice(-10).map((w, i) => `${i + 1}. ${w.reason}`).join("\n");
-    return message.channel.send({ embeds: [embed(`User: ${target}\nTotal: ${list.length}\n\n${last}`, "Warnings")] });
-  }
-
-  if (cmd === "clearwarn" || cmd === "clearwarnings") {
-    const need = PermissionsBitField.Flags.ModerateMembers;
-    if (!hasPerm(message.member, need)) return message.channel.send({ embeds: [embed("Missing permission: Moderate Members", "Error")] });
-
-    const target = await resolveMember(message, args[0]);
-    if (!target) return message.channel.send({ embeds: [usage(`${PREFIX}clearwarn`, "Clear warnings", `${PREFIX}clearwarn <@user|id>`)] });
-
-    clearWarnings(message.guild.id, target.id);
-    const caseNo = nextCase(message.guild.id);
-
-    await message.channel.send({ embeds: [embed(`${target} warnings cleared.`, `ClearWarn | Case #${caseNo}`)] });
-    await modlog(message.guild, `Case #${caseNo}\nAction: ClearWarn\nUser: ${target.user.tag} (${target.id})\nModerator: ${message.author.tag} (${message.author.id})`);
-    return;
-  }
-
-  if (cmd === "kick") {
-    const need = PermissionsBitField.Flags.KickMembers;
-    if (!hasPerm(message.member, need)) return message.channel.send({ embeds: [embed("Missing permission: Kick Members", "Error")] });
-
-    const target = await resolveMember(message, args[0]);
-    if (!target) return message.channel.send({ embeds: [usage(`${PREFIX}kick`, "Kick a user", `${PREFIX}kick <@user|id> (reason)`)] });
-
-    const reason = rest(args, 1);
-    if (!target.kickable) return message.channel.send({ embeds: [embed("I cannot kick this user (role hierarchy).", "Error")] });
-
-    await target.kick(reason);
-    const caseNo = nextCase(message.guild.id);
-
-    await message.channel.send({ embeds: [embed(`${target.user.tag} has been kicked.\nReason: ${reason}`, `Kick | Case #${caseNo}`)] });
-    await modlog(message.guild, `Case #${caseNo}\nAction: Kick\nUser: ${target.user.tag} (${target.id})\nModerator: ${message.author.tag} (${message.author.id})\nReason: ${reason}`);
-    return;
-  }
-
-  if (cmd === "ban") {
-    const need = PermissionsBitField.Flags.BanMembers;
-    if (!hasPerm(message.member, need)) return message.channel.send({ embeds: [embed("Missing permission: Ban Members", "Error")] });
-
-    const target = await resolveMember(message, args[0]);
-    if (!target) return message.channel.send({ embeds: [usage(`${PREFIX}ban`, "Ban a user", `${PREFIX}ban <@user|id> (reason)`)] });
-
-    const reason = rest(args, 1);
-    await message.guild.members.ban(target.id, { reason }).catch(() => null);
-    const caseNo = nextCase(message.guild.id);
-
-    await message.channel.send({ embeds: [embed(`${target.user.tag} has been banned.\nReason: ${reason}`, `Ban | Case #${caseNo}`)] });
-    await modlog(message.guild, `Case #${caseNo}\nAction: Ban\nUser: ${target.user.tag} (${target.id})\nModerator: ${message.author.tag} (${message.author.id})\nReason: ${reason}`);
-    return;
-  }
-
-  if (cmd === "unban") {
-    const need = PermissionsBitField.Flags.BanMembers;
-    if (!hasPerm(message.member, need)) return message.channel.send({ embeds: [embed("Missing permission: Ban Members", "Error")] });
-
-    const id = parseIdOrMention(args[0]); // expect ID
-    if (!id) return message.channel.send({ embeds: [usage(`${PREFIX}unban`, "Unban by user ID", `${PREFIX}unban <userId> (reason)`)] });
-
-    const reason = rest(args, 1);
-    await message.guild.members.unban(id, reason).catch(() => null);
-    const caseNo = nextCase(message.guild.id);
-
-    await message.channel.send({ embeds: [embed(`Unbanned user ID: ${id}\nReason: ${reason}`, `Unban | Case #${caseNo}`)] });
-    await modlog(message.guild, `Case #${caseNo}\nAction: Unban\nUserID: ${id}\nModerator: ${message.author.tag} (${message.author.id})\nReason: ${reason}`);
-    return;
-  }
-
-  // mute/unmute = timeout-based (simple)
-  if (cmd === "mute") {
-    const need = PermissionsBitField.Flags.ModerateMembers;
-    if (!hasPerm(message.member, need)) return message.channel.send({ embeds: [embed("Missing permission: Moderate Members", "Error")] });
-
-    const target = await resolveMember(message, args[0]);
-    const minutes = parseInt(args[1], 10);
-    if (!target || !Number.isFinite(minutes)) {
-      return message.channel.send({ embeds: [usage(`${PREFIX}mute`, "Mute a user (timeout)", `${PREFIX}mute <@user|id> <minutes> (reason)`)] });
-    }
-
-    const reason = rest(args, 2);
-    await target.timeout(minutes * 60 * 1000, reason).catch(() => null);
-    const caseNo = nextCase(message.guild.id);
-
-    await message.channel.send({ embeds: [embed(`${target.user.tag} has been muted.\nDuration: ${minutes} minute(s)\nReason: ${reason}`, `Mute | Case #${caseNo}`)] });
-    await modlog(message.guild, `Case #${caseNo}\nAction: Mute\nUser: ${target.user.tag} (${target.id})\nModerator: ${message.author.tag} (${message.author.id})\nMinutes: ${minutes}\nReason: ${reason}`);
-    return;
-  }
-
-  if (cmd === "unmute") {
-    const need = PermissionsBitField.Flags.ModerateMembers;
-    if (!hasPerm(message.member, need)) return message.channel.send({ embeds: [embed("Missing permission: Moderate Members", "Error")] });
-
-    const target = await resolveMember(message, args[0]);
-    if (!target) return message.channel.send({ embeds: [usage(`${PREFIX}unmute`, "Unmute a user (remove timeout)", `${PREFIX}unmute <@user|id> (reason)`)] });
-
-    const reason = rest(args, 1);
-    await target.timeout(null, reason).catch(() => null);
-    const caseNo = nextCase(message.guild.id);
-
-    await message.channel.send({ embeds: [embed(`${target.user.tag} has been unmuted.\nReason: ${reason}`, `Unmute | Case #${caseNo}`)] });
-    await modlog(message.guild, `Case #${caseNo}\nAction: Unmute\nUser: ${target.user.tag} (${target.id})\nModerator: ${message.author.tag} (${message.author.id})\nReason: ${reason}`);
-    return;
-  }
-
-  if (cmd === "timeout") {
-    const need = PermissionsBitField.Flags.ModerateMembers;
-    if (!hasPerm(message.member, need)) return message.channel.send({ embeds: [embed("Missing permission: Moderate Members", "Error")] });
-
-    const target = await resolveMember(message, args[0]);
-    const minutes = parseInt(args[1], 10);
-    if (!target || !Number.isFinite(minutes)) {
-      return message.channel.send({ embeds: [usage(`${PREFIX}timeout`, "Timeout a user", `${PREFIX}timeout <@user|id> <minutes> (reason)`)] });
-    }
-
-    const reason = rest(args, 2);
-    await target.timeout(minutes * 60 * 1000, reason).catch(() => null);
-    const caseNo = nextCase(message.guild.id);
-
-    await message.channel.send({ embeds: [embed(`${target.user.tag} has been timed out.\nDuration: ${minutes} minute(s)\nReason: ${reason}`, `Timeout | Case #${caseNo}`)] });
-    await modlog(message.guild, `Case #${caseNo}\nAction: Timeout\nUser: ${target.user.tag} (${target.id})\nModerator: ${message.author.tag} (${message.author.id})\nMinutes: ${minutes}\nReason: ${reason}`);
-    return;
-  }
-
-  if (cmd === "untimeout") {
-    const need = PermissionsBitField.Flags.ModerateMembers;
-    if (!hasPerm(message.member, need)) return message.channel.send({ embeds: [embed("Missing permission: Moderate Members", "Error")] });
-
-    const target = await resolveMember(message, args[0]);
-    if (!target) return message.channel.send({ embeds: [usage(`${PREFIX}untimeout`, "Remove timeout", `${PREFIX}untimeout <@user|id> (reason)`)] });
-
-    const reason = rest(args, 1);
-    await target.timeout(null, reason).catch(() => null);
-    const caseNo = nextCase(message.guild.id);
-
-    await message.channel.send({ embeds: [embed(`${target.user.tag} timeout removed.\nReason: ${reason}`, `UnTimeout | Case #${caseNo}`)] });
-    await modlog(message.guild, `Case #${caseNo}\nAction: UnTimeout\nUser: ${target.user.tag} (${target.id})\nModerator: ${message.author.tag} (${message.author.id})\nReason: ${reason}`);
-    return;
-  }
-
-  if (cmd === "purge" || cmd === "clear") {
-    const need = PermissionsBitField.Flags.ManageMessages;
-    if (!hasPerm(message.member, need)) return message.channel.send({ embeds: [embed("Missing permission: Manage Messages", "Error")] });
-
-    const amount = parseInt(args[0], 10);
-    if (!Number.isFinite(amount) || amount < 1 || amount > 100) {
-      return message.channel.send({ embeds: [usage(`${PREFIX}${cmd}`, "Delete messages", `${PREFIX}${cmd} <1-100>`)] });
-    }
-
-    const deleted = await message.channel.bulkDelete(amount, true).catch(() => null);
-    const count = deleted ? deleted.size : 0;
-    const caseNo = nextCase(message.guild.id);
-
-    await message.channel.send({ embeds: [embed(`Deleted ${count} messages.`, `Purge | Case #${caseNo}`)] }).catch(() => {});
-    await modlog(message.guild, `Case #${caseNo}\nAction: Purge\nChannel: #${message.channel.name} (${message.channel.id})\nModerator: ${message.author.tag} (${message.author.id})\nDeleted: ${count}`);
-    return;
-  }
-
-  if (cmd === "slowmode") {
-    const need = PermissionsBitField.Flags.ManageChannels;
-    if (!hasPerm(message.member, need)) return message.channel.send({ embeds: [embed("Missing permission: Manage Channels", "Error")] });
-
-    const seconds = parseInt(args[0], 10);
-    if (!Number.isFinite(seconds) || seconds < 0 || seconds > 21600) {
-      return message.channel.send({ embeds: [usage(`${PREFIX}slowmode`, "Set slowmode for this channel", `${PREFIX}slowmode <seconds>`)] });
-    }
-
-    await message.channel.setRateLimitPerUser(seconds).catch(() => null);
-    return message.channel.send({ embeds: [embed(`Slowmode set to ${seconds}s.`, "Slowmode")] });
-  }
-
-  if (cmd === "lock" || cmd === "unlock") {
-    const need = PermissionsBitField.Flags.ManageChannels;
-    if (!hasPerm(message.member, need)) return message.channel.send({ embeds: [embed("Missing permission: Manage Channels", "Error")] });
-
-    const everyone = message.guild.roles.everyone;
-    const allow = cmd === "unlock";
-    await message.channel.permissionOverwrites.edit(everyone, { SendMessages: allow }).catch(() => null);
-    return message.channel.send({ embeds: [embed(allow ? "Channel unlocked." : "Channel locked.", "Lock")] });
-  }
-
-  if (cmd === "nick") {
-    const need = PermissionsBitField.Flags.ManageNicknames;
-    if (!hasPerm(message.member, need)) return message.channel.send({ embeds: [embed("Missing permission: Manage Nicknames", "Error")] });
-
-    const target = await resolveMember(message, args[0]);
-    const nickname = args.slice(1).join(" ").trim();
-    if (!target || !nickname) return message.channel.send({ embeds: [usage(`${PREFIX}nick`, "Change nickname", `${PREFIX}nick <@user|id> <nickname>`)] });
-
-    await target.setNickname(nickname).catch(() => null);
-    return message.channel.send({ embeds: [embed(`Nickname updated for ${target.user.tag}.`, "Nick")] });
-  }
-
-  // role add/remove + addrole/removerole
-  if (cmd === "role" || cmd === "addrole" || cmd === "removerole") {
-    const need = PermissionsBitField.Flags.ManageRoles;
-    if (!hasPerm(message.member, need)) return message.channel.send({ embeds: [embed("Missing permission: Manage Roles", "Error")] });
-
-    let action, userArg, roleArg;
-    if (cmd === "role") {
-      action = (args[0] || "").toLowerCase();
-      userArg = args[1];
-      roleArg = args[2];
-      if (!["add", "remove"].includes(action)) {
-        return message.channel.send({ embeds: [usage(`${PREFIX}role`, "Add/remove role", `${PREFIX}role add <@user|id> <@role|roleId>\n${PREFIX}role remove <@user|id> <@role|roleId>`)] });
-      }
-    } else {
-      action = cmd === "addrole" ? "add" : "remove";
-      userArg = args[0];
-      roleArg = args[1];
-    }
-
-    const target = await resolveMember(message, userArg);
-    const roleId = parseRoleId(roleArg);
-    if (!target || !roleId) {
-      return message.channel.send({ embeds: [usage(`${PREFIX}${cmd}`, "Role command", `${PREFIX}${cmd} <@user|id> <@role|roleId>`)] });
-    }
-
-    const role = await message.guild.roles.fetch(roleId).catch(() => null);
-    if (!role) return message.channel.send({ embeds: [embed("Role not found.", "Error")] });
-
-    if (action === "add") await target.roles.add(role).catch(() => null);
-    else await target.roles.remove(role).catch(() => null);
-
-    return message.channel.send({ embeds: [embed(`${action === "add" ? "Added" : "Removed"} ${role} ${action === "add" ? "to" : "from"} ${target}.`, "Role")] });
-  }
-
-  /* Server management */
-  if (cmd === "roleinfo") {
-    const roleId = parseRoleId(args[0]);
-    if (!roleId) return message.channel.send({ embeds: [usage(`${PREFIX}roleinfo`, "Show role info", `${PREFIX}roleinfo <@role|roleId>`)] });
-
-    const role = await message.guild.roles.fetch(roleId).catch(() => null);
-    if (!role) return message.channel.send({ embeds: [embed("Role not found.", "Error")] });
-
-    const txt =
-      `Name: ${role.name}\n` +
-      `ID: ${role.id}\n` +
-      `Members: ${role.members.size}\n` +
-      `Color: ${role.hexColor}\n` +
-      `Created: ${role.createdAt.toLocaleString()}`;
-    return message.channel.send({ embeds: [embed(txt, "Role Info")] });
-  }
-
-  if (cmd === "createrole") {
-    const need = PermissionsBitField.Flags.ManageRoles;
-    if (!hasPerm(message.member, need)) return message.channel.send({ embeds: [embed("Missing permission: Manage Roles", "Error")] });
-
-    const name = args.join(" ").trim();
-    if (!name) return message.channel.send({ embeds: [usage(`${PREFIX}createrole`, "Create role", `${PREFIX}createrole <name>`)] });
-
-    const role = await message.guild.roles.create({ name }).catch(() => null);
-    if (!role) return message.channel.send({ embeds: [embed("Failed to create role.", "Error")] });
-
-    return message.channel.send({ embeds: [embed(`Role created: ${role} (${role.id})`, "Create Role")] });
-  }
-
-  if (cmd === "deleterole") {
-    const need = PermissionsBitField.Flags.ManageRoles;
-    if (!hasPerm(message.member, need)) return message.channel.send({ embeds: [embed("Missing permission: Manage Roles", "Error")] });
-
-    const roleId = parseRoleId(args[0]);
-    if (!roleId) return message.channel.send({ embeds: [usage(`${PREFIX}deleterole`, "Delete role", `${PREFIX}deleterole <@role|roleId>`)] });
-
-    const role = await message.guild.roles.fetch(roleId).catch(() => null);
-    if (!role) return message.channel.send({ embeds: [embed("Role not found.", "Error")] });
-
-    await role.delete().catch(() => null);
-    return message.channel.send({ embeds: [embed("Role deleted.", "Delete Role")] });
-  }
-
-  if (cmd === "channelinfo") {
-    const ch = message.channel;
-    const txt =
-      `Name: ${ch.name}\n` +
-      `ID: ${ch.id}\n` +
-      `Type: ${ch.type}\n` +
-      `Created: ${ch.createdAt.toLocaleString()}`;
-    return message.channel.send({ embeds: [embed(txt, "Channel Info")] });
-  }
-
-  if (cmd === "createchannel") {
-    const need = PermissionsBitField.Flags.ManageChannels;
-    if (!hasPerm(message.member, need)) return message.channel.send({ embeds: [embed("Missing permission: Manage Channels", "Error")] });
-
-    const name = args.join(" ").trim();
-    if (!name) return message.channel.send({ embeds: [usage(`${PREFIX}createchannel`, "Create a text channel", `${PREFIX}createchannel <name>`)] });
-
-    const ch = await message.guild.channels.create({ name, type: ChannelType.GuildText }).catch(() => null);
-    if (!ch) return message.channel.send({ embeds: [embed("Failed to create channel.", "Error")] });
-
-    return message.channel.send({ embeds: [embed(`Channel created: <#${ch.id}>`, "Create Channel")] });
-  }
-
-  if (cmd === "deletechannel") {
-    const need = PermissionsBitField.Flags.ManageChannels;
-    if (!hasPerm(message.member, need)) return message.channel.send({ embeds: [embed("Missing permission: Manage Channels", "Error")] });
-
-    await message.channel.delete().catch(() => null);
-    return;
-  }
-
-  /* Voice */
-  if (cmd === "disconnect") {
-    const need = PermissionsBitField.Flags.MoveMembers;
-    if (!hasPerm(message.member, need)) return message.channel.send({ embeds: [embed("Missing permission: Move Members", "Error")] });
-
-    const target = await resolveMember(message, args[0]);
-    if (!target) return message.channel.send({ embeds: [usage(`${PREFIX}disconnect`, "Disconnect user from VC", `${PREFIX}disconnect <@user|id> (reason)`)] });
-
-    const reason = rest(args, 1);
-    if (!target.voice?.channel) return message.channel.send({ embeds: [embed("User is not in a voice channel.", "Voice")] });
-
-    await target.voice.disconnect(reason).catch(() => null);
-    return message.channel.send({ embeds: [embed(`Disconnected ${target.user.tag} from voice.\nReason: ${reason}`, "Voice")] });
-  }
-
-  if (cmd === "disconnectall") {
-    const need = PermissionsBitField.Flags.MoveMembers;
-    if (!hasPerm(message.member, need)) return message.channel.send({ embeds: [embed("Missing permission: Move Members", "Error")] });
-
-    const reason = rest(args, 0);
-    const vc = message.member.voice?.channel;
-    if (!vc) return message.channel.send({ embeds: [embed("You must be in a voice channel.", "Voice")] });
-
-    let count = 0;
-    for (const [, mem] of vc.members) {
-      if (mem.user.bot) continue;
-      await mem.voice.disconnect(reason).catch(() => {});
-      count++;
-    }
-    return message.channel.send({ embeds: [embed(`Disconnected ${count} user(s) from ${vc.name}.\nReason: ${reason}`, "Voice")] });
-  }
-
-  if (cmd === "move") {
-    const need = PermissionsBitField.Flags.MoveMembers;
-    if (!hasPerm(message.member, need)) return message.channel.send({ embeds: [embed("Missing permission: Move Members", "Error")] });
-
-    const target = await resolveMember(message, args[0]);
-    const vcId = parseIdOrMention(args[1]) || args[1];
-    if (!target || !vcId) return message.channel.send({ embeds: [usage(`${PREFIX}move`, "Move user to a voice channel", `${PREFIX}move <@user|id> <voiceChannelId>`)] });
-
-    const vc = await message.guild.channels.fetch(vcId).catch(() => null);
-    if (!vc || vc.type !== ChannelType.GuildVoice) return message.channel.send({ embeds: [embed("Voice channel not found.", "Error")] });
-
-    await target.voice.setChannel(vc).catch(() => null);
-    return message.channel.send({ embeds: [embed(`Moved ${target.user.tag} to ${vc.name}.`, "Move")] });
-  }
-
-  if (cmd === "mutevc" || cmd === "unmutevc") {
-    const need = PermissionsBitField.Flags.MuteMembers;
-    if (!hasPerm(message.member, need)) return message.channel.send({ embeds: [embed("Missing permission: Mute Members", "Error")] });
-
-    const target = await resolveMember(message, args[0]);
-    if (!target) return message.channel.send({ embeds: [usage(`${PREFIX}${cmd}`, "Voice mute/unmute", `${PREFIX}${cmd} <@user|id> (reason)`)] });
-
-    if (!target.voice?.channel) return message.channel.send({ embeds: [embed("User is not in a voice channel.", "Voice")] });
-
-    const shouldMute = cmd === "mutevc";
-    await target.voice.setMute(shouldMute).catch(() => null);
-
-    return message.channel.send({ embeds: [embed(`${shouldMute ? "Muted" : "Unmuted"} ${target.user.tag} in voice.`, "Voice")] });
-  }
-
-  /* Extra: sticky / announce / embed / remind / afk / suggest / report / ticket */
+  // Minimal: keep your sticky old command (simple)
   if (cmd === "sticky") {
     const sub = (args[0] || "").toLowerCase();
-
     if (sub === "set") {
-      const need = PermissionsBitField.Flags.ManageMessages;
-      if (!hasPerm(message.member, need)) return message.channel.send({ embeds: [embed("Missing permission: Manage Messages", "Error")] });
-
+      if (!hasPerm(message.member, PermissionsBitField.Flags.ManageMessages)) {
+        return message.channel.send({ embeds: [E("Missing permission: Manage Messages", "Error")] });
+      }
       const text = message.content.split(/\s+/).slice(2).join(" ").trim();
-      if (!text) return message.channel.send({ embeds: [usage(`${PREFIX}sticky set`, "Set sticky for this channel", `${PREFIX}sticky set <text...>`)] });
-
-      setSticky(message.guild.id, message.channel.id, text);
-      return message.channel.send({ embeds: [embed("Sticky message set.", "Sticky")] });
+      if (!text) {
+        return message.channel.send({
+          embeds: [dynoUsageEmbed({
+            command: `${prefix}sticky set`,
+            description: "Set sticky message for this channel.",
+            usage: `${prefix}sticky set <text...>`,
+            example: `${prefix}sticky set Please read the rules above.`
+          })]
+        });
+      }
+      // store sticky in guild settings as a map
+      s.sticky ??= {};
+      s.sticky[message.channel.id] = { text, lastMessageId: null };
+      saveDB(db);
+      return message.channel.send({ embeds: [E("Sticky message set for this channel.", "Sticky")] });
     }
 
     if (sub === "remove") {
-      const need = PermissionsBitField.Flags.ManageMessages;
-      if (!hasPerm(message.member, need)) return message.channel.send({ embeds: [embed("Missing permission: Manage Messages", "Error")] });
-
-      removeSticky(message.guild.id, message.channel.id);
-      return message.channel.send({ embeds: [embed("Sticky message removed.", "Sticky")] });
+      if (!hasPerm(message.member, PermissionsBitField.Flags.ManageMessages)) {
+        return message.channel.send({ embeds: [E("Missing permission: Manage Messages", "Error")] });
+      }
+      s.sticky ??= {};
+      delete s.sticky[message.channel.id];
+      saveDB(db);
+      return message.channel.send({ embeds: [E("Sticky message removed for this channel.", "Sticky")] });
     }
 
     if (sub === "show") {
-      const st = getSticky(message.guild.id, message.channel.id);
-      if (!st) return message.channel.send({ embeds: [embed("No sticky set for this channel.", "Sticky")] });
-      return message.channel.send({ embeds: [embed(st.text, "Sticky")] });
+      const st = s.sticky?.[message.channel.id];
+      if (!st) return message.channel.send({ embeds: [E("No sticky message set here.", "Sticky")] });
+      return message.channel.send({ embeds: [E(st.text, "Sticky")] });
     }
 
-    return message.channel.send({ embeds: [usage(`${PREFIX}sticky`, "Sticky commands", `${PREFIX}sticky set <text...>\n${PREFIX}sticky remove\n${PREFIX}sticky show`)] });
+    return message.channel.send({
+      embeds: [dynoUsageEmbed({
+        command: `${prefix}sticky`,
+        description: "Sticky message commands.",
+        usage: `${prefix}sticky set <text...>\n${prefix}sticky remove\n${prefix}sticky show`,
+        example: `${prefix}sticky set Welcome to GKH!`
+      })]
+    });
   }
 
-  if (cmd === "announce") {
-    const need = PermissionsBitField.Flags.ManageMessages;
-    if (!hasPerm(message.member, need)) return message.channel.send({ embeds: [embed("Missing permission: Manage Messages", "Error")] });
+  // quick help (prefix)
+  if (cmd === "help") {
+    return message.channel.send({
+      embeds: [E(`Use **/commands** for the full menu.\n\nPrefix: \`${prefix}\`\nExample: \`${prefix}sticky set ...\``, "Help")]
+    });
+  }
+}
 
-    const chRaw = args[0];
-    const chId = chRaw?.match(/^<#(\d+)>$/)?.[1] || (parseIdOrMention(chRaw));
-    if (!chId) return message.channel.send({ embeds: [usage(`${PREFIX}announce`, "Send announcement embed", `${PREFIX}announce <#channel|channelId> <message...>`)] });
+// =====================
+// Sticky repost behavior
+// =====================
+async function handleStickyBehavior(message) {
+  if (!message.guild || message.author.bot) return;
+  const s = gSettings(message.guild.id);
+  const st = s.sticky?.[message.channel.id];
+  if (!st) return;
 
-    const ch = await message.guild.channels.fetch(chId).catch(() => null);
-    if (!ch || !ch.isTextBased()) return message.channel.send({ embeds: [embed("Channel not found.", "Error")] });
+  if (st.lastMessageId && message.id === st.lastMessageId) return;
 
-    const text = args.slice(1).join(" ").trim();
-    if (!text) return message.channel.send({ embeds: [usage(`${PREFIX}announce`, "Send announcement embed", `${PREFIX}announce <#channel|channelId> <message...>`)] });
+  setTimeout(async () => {
+    try {
+      const sent = await message.channel.send({ embeds: [E(st.text, "Sticky")] });
+      st.lastMessageId = sent.id;
+      saveDB(db);
+    } catch {}
+  }, 1200);
+}
 
-    await ch.send({ embeds: [embed(text, "Announcement")] });
-    return message.channel.send({ embeds: [embed("Announcement sent.", "Announce")] });
+// =====================
+// AFK behavior
+// =====================
+async function handleAFK(message) {
+  if (!message.guild || message.author.bot) return;
+
+  const userAFK = db.guilds[message.guild.id]?.afk?.[message.author.id];
+  if (userAFK) {
+    delete db.guilds[message.guild.id].afk[message.author.id];
+    saveDB(db);
+    await message.channel.send({ embeds: [E(`<@${message.author.id}> is no longer AFK.`, "AFK")] }).catch(() => {});
   }
 
-  if (cmd === "afk") {
-    const msg = args.join(" ").trim() || "AFK";
-    setAFK(message.guild.id, message.author.id, msg);
-    return message.channel.send({ embeds: [embed(`<@${message.author.id}> is now AFK: ${msg}`, "AFK")] });
+  for (const u of message.mentions.users.values()) {
+    const afk = db.guilds[message.guild.id]?.afk?.[u.id];
+    if (afk) {
+      await message.channel.send({ embeds: [E(`<@${u.id}> is AFK: ${afk.msg}`, "AFK")] }).catch(() => {});
+    }
+  }
+}
+
+// =====================
+// Leveling (Arcane-like)
+// =====================
+const xpCooldown = new Map(); // key guildId:userId -> timestamp
+
+async function handleXP(message) {
+  if (!message.guild || message.author.bot) return;
+
+  const key = `${message.guild.id}:${message.author.id}`;
+  const now = Date.now();
+  const last = xpCooldown.get(key) || 0;
+  if (now - last < 60_000) return; // 60s cooldown
+
+  xpCooldown.set(key, now);
+
+  const data = lvlData(message.guild.id, message.author.id);
+  const gain = 15 + Math.floor(Math.random() * 11); // 15-25
+  data.xp += gain;
+
+  const newLevel = calcLevelFromXP(data.xp);
+  const oldLevel = data.level;
+  data.level = newLevel;
+  data.lastXpAt = now;
+  saveDB(db);
+
+  if (newLevel > oldLevel) {
+    const s = gSettings(message.guild.id);
+
+    // give role rewards
+    const rewards = (s.levelRoleRewards || []).filter(r => r.level === newLevel);
+    for (const r of rewards) {
+      const role = await message.guild.roles.fetch(r.roleId).catch(() => null);
+      if (role) {
+        const member = await message.guild.members.fetch(message.author.id).catch(() => null);
+        if (member) await member.roles.add(role).catch(() => {});
+      }
+    }
+
+    // announce
+    const channelId = s.levelUpChannelId || message.channel.id;
+    const ch = await fetchTextChannel(message.guild, channelId) || message.channel;
+
+    await ch.send({
+      embeds: [E(`<@${message.author.id}> has reached level **${newLevel}**. GG!`, "Level Up")]
+    }).catch(() => {});
+  }
+}
+
+// =====================
+// Member Join: verification + welcome
+// =====================
+client.on(Events.GuildMemberAdd, async (member) => {
+  const s = gSettings(member.guild.id);
+
+  // Welcome
+  if (s.welcomeChannelId) {
+    const ch = await fetchTextChannel(member.guild, s.welcomeChannelId);
+    if (ch) {
+      const msg = (s.welcomeMessage || "Welcome {user} to {server}!")
+        .replaceAll("{user}", `<@${member.id}>`)
+        .replaceAll("{server}", member.guild.name);
+      ch.send({ embeds: [E(msg, "Welcome")] }).catch(() => {});
+    }
   }
 
-  if (cmd === "suggest") {
-    const text = args.join(" ").trim();
-    if (!text) return message.channel.send({ embeds: [usage(`${PREFIX}suggest`, "Send suggestion", `${PREFIX}suggest <text...>`)] });
+  // Verification role + panel
+  if (s.unverifiedRoleId && s.verifiedRoleId && s.verifyChannelId) {
+    const role = await member.guild.roles.fetch(s.unverifiedRoleId).catch(() => null);
+    if (role) await member.roles.add(role).catch(() => {});
 
-    const ch = await getTextChannel(message.guild, SUGGEST_CHANNEL_ID);
-    if (!ch) return message.channel.send({ embeds: [embed("Suggestions channel not set. Add SUGGEST_CHANNEL_ID in Railway Variables.", "Suggest")] });
-
-    const msg = await ch.send({ embeds: [embed(`From: <@${message.author.id}>\n\n${text}`, "Suggestion")] });
-    await msg.react("👍").catch(() => {});
-    await msg.react("👎").catch(() => {});
-    return message.channel.send({ embeds: [embed("Suggestion sent.", "Suggest")] });
+    const vch = await fetchTextChannel(member.guild, s.verifyChannelId);
+    if (vch) {
+      // Optional: you can send panel once manually too; we won't spam every join.
+      // So only send DM-style ping once:
+      vch.send({ embeds: [E(`Welcome <@${member.id}>. Please verify using the button below.`, "Verification")], components: [verifyRow()] })
+        .catch(() => {});
+    }
   }
-
-  if (cmd === "report") {
-    const target = await resolveMember(message, args[0]);
-    const reason = args.slice(1).join(" ").trim();
-    if (!target || !reason) return message.channel.send({ embeds: [usage(`${PREFIX}report`, "Report a user", `${PREFIX}report <@user|id> <reason...>`)] });
-
-    const ch = await getTextChannel(message.guild, REPORT_CHANNEL_ID);
-    if (!ch) return message.channel.send({ embeds: [embed("Reports channel not set. Add REPORT_CHANNEL_ID in Railway Variables.", "Report")] });
-
-    await ch.send({ embeds: [embed(`Reporter: <@${message.author.id}>\nUser: ${target.user.tag} (${target.id})\nReason: ${reason}`, "Report")] });
-    return message.channel.send({ embeds: [embed("Report sent to staff.", "Report")] });
-  }
-
-  if (cmd === "ticket") {
-    const reason = args.join(" ").trim() || "Support needed";
-    if (!TICKET_CATEGORY_ID) return message.channel.send({ embeds: [embed("TICKET_CATEGORY_ID not set in Railway Variables.", "Ticket")] });
-
-    const cat = await message.guild.channels.fetch(TICKET_CATEGORY_ID).catch(() => null);
-    if (!cat) return message.channel.send({ embeds: [embed("Ticket category not found.", "Ticket")] });
-
-    const name = `ticket-${message.author.username}`.toLowerCase().replace(/[^a-z0-9-]/g, "");
-    const ch = await message.guild.channels.create({
-      name,
-      type: ChannelType.GuildText,
-      parent: cat.id,
-      permissionOverwrites: [
-        { id: message.guild.roles.everyone.id, deny: [PermissionsBitField.Flags.ViewChannel] },
-        { id: message.author.id, allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.ReadMessageHistory] }
-      ]
-    }).catch(() => null);
-
-    if (!ch) return message.channel.send({ embeds: [embed("Failed to create ticket.", "Ticket")] });
-
-    await ch.send({ embeds: [embed(`User: <@${message.author.id}>\nReason: ${reason}`, "Ticket Created")] });
-    return message.channel.send({ embeds: [embed(`Ticket created: <#${ch.id}>`, "Ticket")] });
-  }
-
-  // unknown
-  return message.channel.send({ embeds: [embed(`Unknown command. Use ${PREFIX}help`, "Error")] });
 });
 
-// keep whitespace-safe token
-client.login((process.env.TOKEN || "").trim());
+// =====================
+// Ready
+// =====================
+client.once(Events.ClientReady, async () => {
+  console.log(`Logged in as ${client.user.tag}`);
+  await registerSlash().catch(err => console.log("Slash register error:", err?.message));
+});
+
+// =====================
+// Message events
+// =====================
+client.on(Events.MessageCreate, async (message) => {
+  await handleAFK(message);
+  await handleStickyBehavior(message);
+  await handleXP(message);
+
+  if (!message.guild || message.author.bot) return;
+  await handlePrefix(message);
+});
+
+// =====================
+// Interactions (slash + menu + captcha)
+// =====================
+client.on(Events.InteractionCreate, async (interaction) => {
+  // /commands menu select
+  if (interaction.isStringSelectMenu() && interaction.customId === "commands_menu") {
+    const value = interaction.values?.[0] || "home";
+    return interaction.update({
+      embeds: [commandsMenuEmbed(value)],
+      components: [commandsMenuRow(value)]
+    }).catch(() => {});
+  }
+
+  // Verify button
+  if (interaction.isButton() && interaction.customId === "verify_start") {
+    const s = gSettings(interaction.guild.id);
+
+    if (!s.verifyChannelId || !s.unverifiedRoleId || !s.verifiedRoleId) {
+      return interaction.reply({ ephemeral: true, embeds: [E("Verification is not configured yet. Use /setup-verify.", "Verify")] });
+    }
+
+    const { q, ans } = makeCaptchaQuestion();
+    captchaMap.set(interaction.user.id, ans);
+
+    const modal = new ModalBuilder()
+      .setCustomId("verify_modal")
+      .setTitle("Captcha Verification");
+
+    const input = new TextInputBuilder()
+      .setCustomId("captcha_answer")
+      .setLabel(`Solve: ${q}`)
+      .setStyle(TextInputStyle.Short)
+      .setRequired(true);
+
+    modal.addComponents(new ActionRowBuilder().addComponents(input));
+    return interaction.showModal(modal);
+  }
+
+  // Verify modal submit
+  if (interaction.isModalSubmit() && interaction.customId === "verify_modal") {
+    const s = gSettings(interaction.guild.id);
+
+    const expected = captchaMap.get(interaction.user.id);
+    const got = interaction.fields.getTextInputValue("captcha_answer").trim();
+
+    if (!expected) {
+      return interaction.reply({ ephemeral: true, embeds: [E("Captcha expired. Click Verify again.", "Verify")] });
+    }
+
+    if (got !== expected) {
+      captchaMap.delete(interaction.user.id);
+      return interaction.reply({ ephemeral: true, embeds: [E("Wrong captcha. Click Verify again.", "Verify")] });
+    }
+
+    captchaMap.delete(interaction.user.id);
+
+    const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+    if (!member) return interaction.reply({ ephemeral: true, embeds: [E("Member not found.", "Verify")] });
+
+    const unv = await interaction.guild.roles.fetch(s.unverifiedRoleId).catch(() => null);
+    const ver = await interaction.guild.roles.fetch(s.verifiedRoleId).catch(() => null);
+
+    if (unv) await member.roles.remove(unv).catch(() => {});
+    if (ver) await member.roles.add(ver).catch(() => {});
+
+    await modlog(interaction.guild, `Action: Verify\nUser: ${interaction.user.tag} (${interaction.user.id})`);
+    return interaction.reply({ ephemeral: true, embeds: [E("Verified successfully. Welcome!", "Verify")] });
+  }
+
+  // Slash commands
+  if (!interaction.isChatInputCommand()) return;
+
+  const name = interaction.commandName;
+  const guild = interaction.guild;
+  const member = interaction.member;
+
+  const s = gSettings(guild.id);
+
+  // /commands
+  if (name === "commands") {
+    return interaction.reply({
+      ephemeral: true,
+      embeds: [commandsMenuEmbed("home")],
+      components: [commandsMenuRow("home")]
+    });
+  }
+
+  // /setmodlogs
+  if (name === "setmodlogs") {
+    if (!hasPerm(member, PermissionsBitField.Flags.ManageGuild)) {
+      return interaction.reply({ ephemeral: true, embeds: [E("Missing permission: Manage Server", "Error")] });
+    }
+    const ch = interaction.options.getChannel("channel", true);
+    s.modlogChannelId = ch.id;
+    saveDB(db);
+    return interaction.reply({ embeds: [E(`Mod logs channel set to <#${ch.id}>`, "Settings")] });
+  }
+
+  // /setup-verify
+  if (name === "setup-verify") {
+    if (!hasPerm(member, PermissionsBitField.Flags.ManageGuild)) {
+      return interaction.reply({ ephemeral: true, embeds: [E("Missing permission: Manage Server", "Error")] });
+    }
+    const ch = interaction.options.getChannel("channel", true);
+    const unv = interaction.options.getRole("unverified", true);
+    const ver = interaction.options.getRole("verified", true);
+
+    s.verifyChannelId = ch.id;
+    s.unverifiedRoleId = unv.id;
+    s.verifiedRoleId = ver.id;
+    saveDB(db);
+
+    // send panel
+    await ch.send({ embeds: [verifyPanelEmbed(guild.name)], components: [verifyRow()] }).catch(() => {});
+
+    return interaction.reply({ embeds: [E(`Verification configured.\nChannel: <#${ch.id}>\nUnverified: <@&${unv.id}>\nVerified: <@&${ver.id}>`, "Settings")] });
+  }
+
+  // /setup-welcome
+  if (name === "setup-welcome") {
+    if (!hasPerm(member, PermissionsBitField.Flags.ManageGuild)) {
+      return interaction.reply({ ephemeral: true, embeds: [E("Missing permission: Manage Server", "Error")] });
+    }
+    const ch = interaction.options.getChannel("channel", true);
+    const msg = interaction.options.getString("message", true);
+
+    s.welcomeChannelId = ch.id;
+    s.welcomeMessage = msg;
+    saveDB(db);
+
+    return interaction.reply({ embeds: [E(`Welcome configured.\nChannel: <#${ch.id}>\nMessage: ${msg}`, "Settings")] });
+  }
+
+  // /prefix
+  if (name === "prefix") {
+    if (!hasPerm(member, PermissionsBitField.Flags.ManageGuild)) {
+      return interaction.reply({ ephemeral: true, embeds: [E("Missing permission: Manage Server", "Error")] });
+    }
+    const p = interaction.options.getString("prefix", true);
+    if (p.length > 3) return interaction.reply({ ephemeral: true, embeds: [E("Prefix too long. Use 1-3 characters.", "Error")] });
+
+    s.prefix = p;
+    saveDB(db);
+    return interaction.reply({ embeds: [E(`Prefix updated to \`${p}\``, "Settings")] });
+  }
+
+  // /ping
+  if (name === "ping") {
+    return interaction.reply({ embeds: [E(`Latency: ${client.ws.ping}ms`, "Ping")] });
+  }
+
+  // /uptime
+  if (name === "uptime") {
+    return interaction.reply({ embeds: [E(uptimeStr(), "Uptime")] });
+  }
+
+  // /botinfo
+  if (name === "botinfo") {
+    const txt =
+      `Tag: ${client.user.tag}\n` +
+      `Servers: ${client.guilds.cache.size}\n` +
+      `Uptime: ${uptimeStr()}`;
+    return interaction.reply({ embeds: [E(txt, "Bot Info")] });
+  }
+
+  // /serverinfo
+  if (name === "serverinfo") {
+    const owner = await guild.fetchOwner().catch(() => null);
+    const txt =
+      `Name: ${guild.name}\n` +
+      `ID: ${guild.id}\n` +
+      `Owner: ${owner ? owner.user.tag : "Unknown"}\n` +
+      `Members: ${guild.memberCount}\n` +
+      `Boosts: ${guild.premiumSubscriptionCount || 0}\n` +
+      `Created: ${guild.createdAt.toLocaleString()}`;
+    return interaction.reply({ embeds: [E(txt, "Server Info")] });
+  }
+
+  // /userinfo
+  if (name === "userinfo") {
+    const u = interaction.options.getUser("user") || interaction.user;
+    const m = await guild.members.fetch(u.id).catch(() => null);
+    const roles = m ? m.roles.cache.filter(r => r.id !== guild.id).map(r => r.toString()).slice(0, 15).join(" ") : "—";
+    const txt =
+      `User: ${u.tag}\n` +
+      `ID: ${u.id}\n` +
+      `Created: ${u.createdAt.toLocaleString()}\n` +
+      `Joined: ${m?.joinedAt ? m.joinedAt.toLocaleString() : "—"}\n` +
+      `Roles: ${roles || "None"}`;
+    return interaction.reply({ embeds: [E(txt, "User Info")] });
+  }
+
+  // /avatar
+  if (name === "avatar") {
+    const u = interaction.options.getUser("user") || interaction.user;
+    return interaction.reply({ embeds: [E(u.displayAvatarURL({ size: 1024 }), "Avatar")] });
+  }
+
+  // /banner
+  if (name === "banner") {
+    const u = interaction.options.getUser("user") || interaction.user;
+    const full = await u.fetch().catch(() => null);
+    const url = full?.bannerURL({ size: 1024 }) || "No banner found.";
+    return interaction.reply({ embeds: [E(url, "Banner")] });
+  }
+
+  // /poll
+  if (name === "poll") {
+    const q = interaction.options.getString("question", true);
+    const msg = await interaction.reply({ embeds: [E(q, "Poll")], fetchReply: true });
+    await msg.react("👍").catch(() => {});
+    await msg.react("👎").catch(() => {});
+    return;
+  }
+
+  // /afk
+  if (name === "afk") {
+    db.guilds[guild.id] ??= {};
+    db.guilds[guild.id].afk ??= {};
+    const msg = interaction.options.getString("message") || "AFK";
+    db.guilds[guild.id].afk[interaction.user.id] = { msg, at: Date.now() };
+    saveDB(db);
+    return interaction.reply({ embeds: [E(`AFK set: ${msg}`, "AFK")], ephemeral: true });
+  }
+
+  // Leveling: /rank, /leaderboard, /setlevelchannel, /levelrole
+  if (name === "setlevelchannel") {
+    if (!hasPerm(member, PermissionsBitField.Flags.ManageGuild)) {
+      return interaction.reply({ ephemeral: true, embeds: [E("Missing permission: Manage Server", "Error")] });
+    }
+    const ch = interaction.options.getChannel("channel", true);
+    s.levelUpChannelId = ch.id;
+    saveDB(db);
+    return interaction.reply({ embeds: [E(`Level-up channel set to <#${ch.id}>`, "Leveling")] });
+  }
+
+  if (name === "levelrole") {
+    if (!hasPerm(member, PermissionsBitField.Flags.ManageGuild)) {
+      return interaction.reply({ ephemeral: true, embeds: [E("Missing permission: Manage Server", "Error")] });
+    }
+    const level = interaction.options.getInteger("level", true);
+    const role = interaction.options.getRole("role", true);
+    s.levelRoleRewards ??= [];
+    // replace if existing
+    s.levelRoleRewards = s.levelRoleRewards.filter(r => r.level !== level);
+    s.levelRoleRewards.push({ level, roleId: role.id });
+    saveDB(db);
+    return interaction.reply({ embeds: [E(`Role reward set.\nLevel: **${level}** → Role: ${role}`, "Leveling")] });
+  }
+
+  if (name === "rank") {
+    const u = interaction.options.getUser("user") || interaction.user;
+    const data = lvlData(guild.id, u.id);
+    const need = xpNeededFor(data.level);
+    const txt =
+      `User: <@${u.id}>\n` +
+      `Level: **${data.level}**\n` +
+      `XP: **${data.xp}**\n` +
+      `Next Level XP Needed: **${need}**`;
+    return interaction.reply({ embeds: [E(txt, "Rank")] });
+  }
+
+  if (name === "leaderboard") {
+    const map = db.levels[guild.id] || {};
+    const rows = Object.entries(map)
+      .map(([uid, d]) => ({ uid, xp: d.xp, level: d.level }))
+      .sort((a, b) => b.xp - a.xp)
+      .slice(0, 10);
+
+    if (rows.length === 0) {
+      return interaction.reply({ embeds: [E("No leaderboard data yet. Chat more to gain XP.", "Leaderboard")] });
+    }
+
+    const lines = rows.map((r, i) => `#${i + 1} <@${r.uid}> • LVL: **${r.level}** • XP: **${r.xp}**`);
+    return interaction.reply({ embeds: [E(lines.join("\n"), "Leaderboard")] });
+  }
+
+  // Moderation: /ban / unban / kick / timeout / warn / warnings / clearwarns / purge / lock / unlock / slowmode / nuke
+  if (name === "warn") {
+    if (!hasPerm(member, PermissionsBitField.Flags.ModerateMembers)) {
+      return interaction.reply({ ephemeral: true, embeds: [E("Missing permission: Moderate Members", "Error")] });
+    }
+    const u = interaction.options.getUser("user", true);
+    const reason = interaction.options.getString("reason") || "No reason provided";
+    addWarn(guild.id, u.id, { at: Date.now(), modId: interaction.user.id, reason });
+
+    await interaction.reply({ embeds: [E(`<@${u.id}> has been warned.\nReason: ${reason}`, "Warn")] });
+    await modlog(guild, `Action: Warn\nUser: ${u.tag} (${u.id})\nModerator: ${interaction.user.tag}\nReason: ${reason}`);
+    return;
+  }
+
+  if (name === "warnings") {
+    if (!hasPerm(member, PermissionsBitField.Flags.ModerateMembers)) {
+      return interaction.reply({ ephemeral: true, embeds: [E("Missing permission: Moderate Members", "Error")] });
+    }
+    const u = interaction.options.getUser("user", true);
+    const list = getWarns(guild.id, u.id);
+    if (list.length === 0) return interaction.reply({ embeds: [E(`<@${u.id}> has no warnings.`, "Warnings")] });
+
+    const lines = list.slice(-10).map((w, i) => `${i + 1}. ${w.reason}`);
+    return interaction.reply({ embeds: [E(`User: <@${u.id}>\nTotal: **${list.length}**\n\n${lines.join("\n")}`, "Warnings")] });
+  }
+
+  if (name === "clearwarns") {
+    if (!hasPerm(member, PermissionsBitField.Flags.ModerateMembers)) {
+      return interaction.reply({ ephemeral: true, embeds: [E("Missing permission: Moderate Members", "Error")] });
+    }
+    const u = interaction.options.getUser("user", true);
+    clearWarns(guild.id, u.id);
+    await interaction.reply({ embeds: [E(`Warnings cleared for <@${u.id}>.`, "ClearWarns")] });
+    await modlog(guild, `Action: ClearWarns\nUser: ${u.tag} (${u.id})\nModerator: ${interaction.user.tag}`);
+    return;
+  }
+
+  if (name === "timeout") {
+    if (!hasPerm(member, PermissionsBitField.Flags.ModerateMembers)) {
+      return interaction.reply({ ephemeral: true, embeds: [E("Missing permission: Moderate Members", "Error")] });
+    }
+    const u = interaction.options.getUser("user", true);
+    const minutes = interaction.options.getInteger("minutes", true);
+    const reason = interaction.options.getString("reason") || "No reason provided";
+    const m = await guild.members.fetch(u.id).catch(() => null);
+    if (!m) return interaction.reply({ ephemeral: true, embeds: [E("User not found in server.", "Error")] });
+
+    await m.timeout(minutes * 60 * 1000, reason).catch(() => null);
+    await interaction.reply({ embeds: [E(`<@${u.id}> has been timed out.\nDuration: ${minutes} minute(s)\nReason: ${reason}`, "Timeout")] });
+    await modlog(guild, `Action: Timeout\nUser: ${u.tag} (${u.id})\nModerator: ${interaction.user.tag}\nMinutes: ${minutes}\nReason: ${reason}`);
+    return;
+  }
+
+  if (name === "kick") {
+    if (!hasPerm(member, PermissionsBitField.Flags.KickMembers)) {
+      return interaction.reply({ ephemeral: true, embeds: [E("Missing permission: Kick Members", "Error")] });
+    }
+    const u = interaction.options.getUser("user", true);
+    const reason = interaction.options.getString("reason") || "No reason provided";
+    const m = await guild.members.fetch(u.id).catch(() => null);
+    if (!m || !m.kickable) return interaction.reply({ ephemeral: true, embeds: [E("Cannot kick (role hierarchy or missing permissions).", "Error")] });
+
+    await m.kick(reason);
+    await interaction.reply({ embeds: [E(`<@${u.id}> has been kicked.\nReason: ${reason}`, "Kick")] });
+    await modlog(guild, `Action: Kick\nUser: ${u.tag} (${u.id})\nModerator: ${interaction.user.tag}\nReason: ${reason}`);
+    return;
+  }
+
+  if (name === "ban") {
+    if (!hasPerm(member, PermissionsBitField.Flags.BanMembers)) {
+      return interaction.reply({ ephemeral: true, embeds: [E("Missing permission: Ban Members", "Error")] });
+    }
+    const u = interaction.options.getUser("user", true);
+    const reason = interaction.options.getString("reason") || "No reason provided";
+
+    await guild.members.ban(u.id, { reason }).catch(() => null);
+    await interaction.reply({ embeds: [E(`<@${u.id}> has been banned.\nReason: ${reason}`, "Ban")] });
+    await modlog(guild, `Action: Ban\nUser: ${u.tag} (${u.id})\nModerator: ${interaction.user.tag}\nReason: ${reason}`);
+    return;
+  }
+
+  if (name === "unban") {
+    if (!hasPerm(member, PermissionsBitField.Flags.BanMembers)) {
+      return interaction.reply({ ephemeral: true, embeds: [E("Missing permission: Ban Members", "Error")] });
+    }
+    const uid = interaction.options.getString("userid", true);
+    const reason = interaction.options.getString("reason") || "No reason provided";
+    await guild.members.unban(uid, reason).catch(() => null);
+
+    await interaction.reply({ embeds: [E(`Unbanned user ID: ${uid}\nReason: ${reason}`, "Unban")] });
+    await modlog(guild, `Action: Unban\nUserID: ${uid}\nModerator: ${interaction.user.tag}\nReason: ${reason}`);
+    return;
+  }
+
+  if (name === "purge") {
+    if (!hasPerm(member, PermissionsBitField.Flags.ManageMessages)) {
+      return interaction.reply({ ephemeral: true, embeds: [E("Missing permission: Manage Messages", "Error")] });
+    }
+    const amount = interaction.options.getInteger("amount", true);
+    if (amount < 1 || amount > 100) {
+      return interaction.reply({ ephemeral: true, embeds: [E("Amount must be 1-100.", "Error")] });
+    }
+    const deleted = await interaction.channel.bulkDelete(amount, true).catch(() => null);
+    const count = deleted ? deleted.size : 0;
+    await interaction.reply({ embeds: [E(`Deleted ${count} message(s).`, "Purge")], ephemeral: true });
+    await modlog(guild, `Action: Purge\nChannel: #${interaction.channel.name} (${interaction.channel.id})\nModerator: ${interaction.user.tag}\nDeleted: ${count}`);
+    return;
+  }
+
+  if (name === "slowmode") {
+    if (!hasPerm(member, PermissionsBitField.Flags.ManageChannels)) {
+      return interaction.reply({ ephemeral: true, embeds: [E("Missing permission: Manage Channels", "Error")] });
+    }
+    const seconds = interaction.options.getInteger("seconds", true);
+    if (seconds < 0 || seconds > 21600) {
+      return interaction.reply({ ephemeral: true, embeds: [E("Seconds must be 0-21600.", "Error")] });
+    }
+    await interaction.channel.setRateLimitPerUser(seconds).catch(() => null);
+    return interaction.reply({ embeds: [E(`Slowmode set to ${seconds}s.`, "Slowmode")] });
+  }
+
+  if (name === "lock" || name === "unlock") {
+    if (!hasPerm(member, PermissionsBitField.Flags.ManageChannels)) {
+      return interaction.reply({ ephemeral: true, embeds: [E("Missing permission: Manage Channels", "Error")] });
+    }
+    const allow = name === "unlock";
+    const everyone = guild.roles.everyone;
+    await interaction.channel.permissionOverwrites.edit(everyone, { SendMessages: allow }).catch(() => null);
+    return interaction.reply({ embeds: [E(allow ? "Channel unlocked." : "Channel locked.", "Channel")] });
+  }
+
+  if (name === "nuke") {
+    if (!hasPerm(member, PermissionsBitField.Flags.ManageChannels)) {
+      return interaction.reply({ ephemeral: true, embeds: [E("Missing permission: Manage Channels", "Error")] });
+    }
+    const old = interaction.channel;
+    const cloned = await old.clone().catch(() => null);
+    if (!cloned) return interaction.reply({ ephemeral: true, embeds: [E("Failed to clone channel.", "Error")] });
+
+    await old.delete().catch(() => null);
+    // cannot reply after delete; so best effort:
+    return;
+  }
+});
+
+// =====================
+// Start
+// =====================
+client.login(TOKEN);
